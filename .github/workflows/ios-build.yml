@@ -1,0 +1,54 @@
+name: iOS build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Run policy tests
+        run: bash Tests/run_policy_tests.sh
+
+      - name: Build unsigned iOS app
+        run: >-
+          xcodebuild
+          -project ThreeOneOSSix.xcodeproj
+          -scheme 3106
+          -configuration Release
+          -sdk iphoneos
+          -derivedDataPath "$RUNNER_TEMP/DerivedData"
+          CODE_SIGNING_ALLOWED=NO
+          CODE_SIGNING_REQUIRED=NO
+          CODE_SIGN_IDENTITY=""
+          build
+
+      - name: Package unsigned IPA
+        run: |
+          set -euo pipefail
+          APP_PATH="$RUNNER_TEMP/DerivedData/Build/Products/Release-iphoneos/3106.app"
+          test -d "$APP_PATH"
+          mkdir -p dist/Payload
+          cp -R "$APP_PATH" dist/Payload/
+          (cd dist && /usr/bin/zip -qry 3106-3.2.3-unsigned.ipa Payload)
+          shasum -a 256 dist/3106-3.2.3-unsigned.ipa
+
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: 3106-3.2.3-unsigned-ipa
+          path: dist/3106-3.2.3-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 14

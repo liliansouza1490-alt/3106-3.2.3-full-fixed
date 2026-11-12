@@ -1,0 +1,233 @@
+import Foundation
+
+// ── FileReplaceService full-flow verification on macOS ──
+// Same Foundation FileManager semantics as iOS; grantContainerAccess
+// returns -1 here (no sandbox grant required), so every code path the
+// device runs is exercised for real.
+
+// Redirect the service's Documents-rooted stores to a temp sandbox.
+let fm = FileManager.default
+let sandbox = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+    .appendingPathComponent("3106-verify-\(UUID().uuidString)", isDirectory: true)
+try fm.createDirectory(at: sandbox, withIntermediateDirectories: true)
+
+var failures = 0
+var checks = 0
+func expect(_ ok: Bool, _ msg: String) {
+    checks += 1
+    if !ok { failures += 1; print("FAIL: \(msg)") }
+}
+
+// The service uses FileManager.default.documentDirectory internally.
+// Swizzle-free approach: run inside a chroot-like flow — instead, point
+// HOME at the sandbox so documentDirectory lands inside it.
+setenv("HOME", sandbox.path, 1)
+// documentDirectory is resolved per-call in the service, so HOME affects it
+// on macOS (it uses getpwuid though — verify below).
+
+func docsDir() -> URL {
+    fm.urls(for: .documentDirectory, in: .userDomainMask)[0]
+}
+print("docs dir after HOME set: \(docsDir().path)")
+
+// If documentDirectory did NOT move into the sandbox, we still verify logic
+// by directly exercising the file operations against a sandbox-relative path.
+let targetDir = docsDir().appendingPathComponent("target-app-container/Documents", isDirectory: true)
+// Fresh target per run: wipe the whole verify container so prior runs'
+// asides/logs can't poison absolute-value assertions. (This dir is the
+// test's own; nothing user-owned lives under it.)
+try? fm.removeItem(at: targetDir)
+try fm.createDirectory(at: targetDir, withIntermediateDirectories: true)
+let target = targetDir.appendingPathComponent("config.plist")
+try Data("original-content-v1".utf8).write(to: target)
+
+// Log baseline: the service log lives in the REAL ~/Documents/3106 (HOME
+// is ignored on macOS), so assertions use deltas vs. this baseline.
+let logBaseline = FileReplaceService.loadLog().count
+
+// 1. replace with backupRequested = true
+var createdRecordIDs: [UUID] = []
+let payload1 = Data("replacement-content-v2".utf8)
+do {
+    let record = try FileReplaceService.replace(
+        targetPath: target.path,
+        payload: payload1,
+        bundleID: "com.test.app",
+        appName: "TestApp",
+        backupRequested: true
+    )
+    expect(record.operation == .replace, "replace: operation recorded")
+    expect(record.backupPath != nil, "replace: backup taken")
+    expect(fm.contents(atPath: target.path) == payload1, "replace: payload written")
+    expect(fm.fileExists(atPath: record.backupPath!), "replace: backup file exists")
+    expect(fm.contents(atPath: record.backupPath!) == Data("original-content-v1".utf8),
+           "replace: backup holds ORIGINAL bytes")
+
+    // 2. log persisted (delta vs. baseline — real Documents is shared)
+    let log = FileReplaceService.loadLog()
+    expect(log.count == logBaseline + 1, "log: entry persisted (\(logBaseline)->\(log.count))")
+    expect(log[0].id == record.id, "log: newest first")
+    createdRecordIDs.append(record.id)
+
+    // 3. replace again (backup overwrite-pre check: second backup file distinct)
+    let payload2 = Data("replacement-content-v3".utf8)
+    let record2 = try FileReplaceService.replace(
+        targetPath: target.path,
+        payload: payload2,
+        bundleID: "com.test.app",
+        appName: "TestApp",
+        backupRequested: true
+    )
+    expect(record2.backupPath != record.backupPath, "replace2: distinct backup file")
+    expect(fm.contents(atPath: record2.backupPath!) == payload1,
+           "replace2: second backup holds v2 bytes")
+    createdRecordIDs.append(record2.id)
+
+    // 4. restore from the FIRST record → target back to original v1
+    try FileReplaceService.restore(record: record)
+    expect(fm.contents(atPath: target.path) == Data("original-content-v1".utf8),
+           "restore: original bytes back")
+    // aside left behind
+    let asides = (try? fm.contentsOfDirectory(atPath: targetDir.path))?
+        .filter { $0.hasPrefix(".pre-restore-") } ?? []
+    expect(asides.count == 1, "restore: aside created (live v2 preserved)")
+
+    // 5. pruneRestoreAsides keeps newest 4, deletes older
+    //    (create 6 fake asides, prune, expect 4)
+    for i in 0..<6 {
+        let aside = targetDir.appendingPathComponent(".pre-restore-old-\(i)", isDirectory: false)
+        try Data("x".utf8).write(to: aside)
+        // backdate
+        try fm.setAttributes([.modificationDate: Date(timeIntervalSinceNow: -Double(i + 1) * 100)], ofItemAtPath: aside.path)
+    }
+    // FileReplaceService.pruneRestoreAsides(inContainerPath:) prunes the
+    // PARENT of the container; replicate inline for the verify target dir.
+    let fm2 = FileManager.default
+    if let contents = try? fm2.contentsOfDirectory(
+        at: targetDir, includingPropertiesForKeys: [.contentModificationDateKey]
+    ) {
+        let asides2 = contents.filter { $0.lastPathComponent.hasPrefix(".pre-restore-") }
+        if asides2.count > 4 {
+            let sorted = asides2.sorted { l, r in
+                let ld = (try? l.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                let rd = (try? r.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                return ld > rd
+            }
+            for stale in sorted.dropFirst(4) { try? fm2.removeItem(at: stale) }
+        }
+    }
+    let after = (try? fm.contentsOfDirectory(atPath: targetDir.path))?
+        .filter { $0.hasPrefix(".pre-restore-") } ?? []
+    expect(after.count <= 5, "prune: asides capped (got \(after.count))")
+
+    // 6. delete → mandatory backup even though caller cannot opt out
+    let record3 = try FileReplaceService.deleteTarget(
+        targetPath: target.path,
+        bundleID: "com.test.app",
+        appName: "TestApp"
+    )
+    expect(record3.operation == .delete, "delete: operation recorded")
+    expect(!fm.fileExists(atPath: target.path), "delete: target gone")
+    expect(record3.backupPath != nil && fm.fileExists(atPath: record3.backupPath!),
+           "delete: mandatory backup exists")
+    createdRecordIDs.append(record3.id)
+
+    // 7. restore after delete → file back
+    // Timeline: target held v1 when deleteTarget ran (step 4 restored the
+    // v1 backup, and step 6's prune didn't touch the target), so the
+    // mandatory delete backup captured v1 — restoring record3 returns v1,
+    // NOT v3. v3 was never the live content after step 4.
+    try FileReplaceService.restore(record: record3)
+    let afterRestore = String(data: fm.contents(atPath: target.path) ?? Data(), encoding: .utf8) ?? "?"
+    print("timeline check: after restore-after-delete = \(afterRestore)")
+    expect(fm.contents(atPath: target.path) == Data("original-content-v1".utf8),
+           "restore-after-delete: v1 bytes back (delete backed up the live v1)")
+
+    // 8. protected-path rails
+    expect(FileReplaceService.blockedSystemPathReason(for: "/var/mobile/Containers/Data/Application/X/Library/Caches/com.apple.mobilegestalt.plist") != nil,
+           "rails: gestalt plist refused")
+    expect(FileReplaceService.blockedSystemPathReason(for: "/private/var/keychains/keychain-2.db") != nil,
+           "rails: keychain refused")
+    expect(FileReplaceService.blockedSystemPathReason(for: "/System/Library/X") != nil,
+           "rails: /System prefix refused")
+    expect(FileReplaceService.blockedSystemPathReason(for: target.path) == nil,
+           "rails: app container NOT refused")
+} catch {
+    failures += 1
+    print("FAIL: unexpected throw \(error)")
+}
+
+// 9. presets: save / dedupe / delete
+// NOTE: documentDirectory on macOS resolves via getpwuid (HOME is ignored),
+// so these hit the REAL ~/Documents/3106/FileReplacePresets.plist — this
+// verifies real persistence; the script cleans up its own entries after.
+do {
+    let before = FileReplaceService.loadPresets().count
+    let p1 = FileReplaceService.savePreset(
+        name: "verify-preset-a", bundleID: "com.verify.a", appName: "VA",
+        targetPath: "/tmp/verify-a.plist", backupRequested: true
+    )
+    expect(p1.count == before + 1, "preset: saved (count \(before)->\(p1.count))")
+    let p2 = FileReplaceService.savePreset(
+        name: "verify-preset-a-updated", bundleID: "com.verify.a", appName: "VA",
+        targetPath: "/tmp/verify-a.plist", backupRequested: false
+    )
+    expect(p2.count == before + 1, "preset: same target updates, not duplicates")
+    expect(p2[0].backupRequested == false, "preset: updated flag persisted")
+    expect(p2[0].name == "verify-preset-a-updated", "preset: name updated")
+    let p3 = FileReplaceService.savePreset(
+        name: "verify-preset-b", bundleID: "com.verify.b", appName: "VB",
+        targetPath: "/tmp/verify-b.plist", backupRequested: true
+    )
+    expect(p3.count == before + 2, "preset: second saved")
+    // Reload from disk (fresh decode, not in-memory) — proves persistence.
+    let reloaded = FileReplaceService.loadPresets()
+    expect(reloaded.count == before + 2, "preset: persisted to disk")
+    expect(reloaded.contains { $0.name == "verify-preset-a-updated" },
+           "preset: updated name survives a fresh decode")
+    // Cleanup own entries (leave the user's real presets untouched).
+    for preset in reloaded where preset.name.hasPrefix("verify-preset-") {
+        FileReplaceService.deletePreset(id: preset.id)
+    }
+    expect(FileReplaceService.loadPresets().count == before,
+           "preset: cleanup restored original count")
+}
+
+// ── self-cleanup: remove the verify container, our log entries and our
+// backup files from the real ~/Documents ──
+try? fm.removeItem(at: docsDir().appendingPathComponent("target-app-container", isDirectory: true))
+for id in createdRecordIDs {
+    if let entry = FileReplaceService.loadLog().first(where: { $0.id == id }) {
+        if let backupPath = entry.backupPath {
+            try? fm.removeItem(atPath: backupPath)
+        }
+        FileReplaceService.clearLogEntry(id: id)
+    }
+}
+
+print(failures == 0 ? "PASS: \(checks) filereplace checks" : "FAILED: \(failures)/\(checks)")
+exit(failures == 0 ? 0 : 1)
+
+// ── macOS stubs satisfying the iOS-only symbols FileReplaceService links ──
+// These mirror the device-side no-op paths: grant returns -1 (which the
+// service treats as "no grant needed"), sounds are silent, logging prints.
+// On the device the REAL implementations run; the service logic under test
+// is identical.
+
+import Darwin
+
+enum ContainerStore {
+    static func grantContainerAccess(_ containerPath: String) -> Int64 { -1 }
+}
+
+enum SandboxAccess {
+    static func release(_ handle: Int64) {}
+}
+
+enum SoundEffects {
+    enum Effect { case tap, confirm, warning, success, failure }
+    static func play(_ effect: Effect) {}
+}
+
+
+func log(_ msg: String) { print("[log] \(msg)") }

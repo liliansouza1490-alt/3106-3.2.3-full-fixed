@@ -1,0 +1,76 @@
+import Foundation
+
+// ── End-to-end update check verification: REAL GitHub API ──
+// Exercises the exact request AppUpdateChecker.check() makes, then feeds
+// the response through the same normalize/isNewer path the app uses.
+
+var failures = 0
+var checks = 0
+func expect(_ ok: Bool, _ msg: String) {
+    checks += 1
+    if !ok { failures += 1; print("FAIL: \(msg)") }
+}
+func expectFalse(_ ok: Bool, _ msg: String) {
+    expect(!ok, msg)
+}
+
+let apiURL = URL(string: "https://api.github.com/repos/QuinnTang74/3106/releases/latest")!
+var request = URLRequest(url: apiURL)
+request.timeoutInterval = 15
+request.setValue("3106", forHTTPHeaderField: "User-Agent")
+request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+
+let semaphore = DispatchSemaphore(value: 0)
+var remoteTag: String?
+var assetsCount = 0
+
+URLSession.shared.dataTask(with: request) { data, response, error in
+    defer { semaphore.signal() }
+    guard error == nil,
+          let http = response as? HTTPURLResponse,
+          (200..<300).contains(http.statusCode),
+          let data,
+          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    else { return }
+    remoteTag = obj["tag_name"] as? String
+    assetsCount = (obj["assets"] as? [[String: Any]])?.count ?? 0
+}.resume()
+semaphore.wait()
+
+expect(remoteTag != nil, "e2e: GitHub latest reachable (got \(remoteTag ?? "nil"))")
+expect(remoteTag == "v3.2.1", "e2e: latest tag is v3.2.1 (got \(remoteTag ?? "nil"))")
+expect(assetsCount >= 2, "e2e: IPA + SHA256SUMS attached (got \(assetsCount))")
+
+// The app's decode path: GitHubRelease(tagName:htmlURL:) + normalize + isNewer
+func normalize(_ version: String) -> String {
+    var value = version.trimmingCharacters(in: .whitespacesAndNewlines)
+    if value.lowercased().hasPrefix("v") { value.removeFirst() }
+    return value
+}
+func numericParts(_ version: String) -> [Int] {
+    let core = version.split(separator: "-").first.map(String.init) ?? version
+    return core.split(separator: ".").compactMap { Int($0.filter(\.isNumber)) }
+}
+func isNewer(_ remote: String, than local: String) -> Bool {
+    let r = numericParts(normalize(remote))
+    let l = numericParts(normalize(local))
+    let count = max(r.count, l.count)
+    for i in 0..<count {
+        let rv = i < r.count ? r[i] : 0
+        let lv = i < l.count ? l[i] : 0
+        if rv != lv { return rv > lv }
+    }
+    return false
+}
+
+let tag = remoteTag ?? ""
+expect(normalize(tag) == "3.2.1", "e2e: normalize strips v (got \(normalize(tag)))")
+
+// A device running 3.2.1 must NOT see an update (the operator's report);
+// a device on 3.2.0/3.1.13 MUST.
+expectFalse(isNewer(tag, than: "3.2.1"), "e2e: 3.2.1 device gets NO prompt")
+expect(isNewer(tag, than: "3.2.0"), "e2e: 3.2.0 device gets prompted")
+expect(isNewer(tag, than: "3.1.13"), "e2e: 3.1.13 device gets prompted")
+
+print(failures == 0 ? "PASS: \(checks) e2e update checks" : "FAILED: \(failures)/\(checks)")
+exit(failures == 0 ? 0 : 1)
